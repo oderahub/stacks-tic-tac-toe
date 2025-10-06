@@ -4,6 +4,11 @@
 (define-constant ERR_GAME_NOT_FOUND u102) ;; Error thrown when a game cannot be found given a Game ID, i.e. invalid Game ID
 (define-constant ERR_GAME_CANNOT_BE_JOINED u103) ;; Error thrown when a game cannot be joined, usually because it already has two players
 (define-constant ERR_NOT_YOUR_TURN u104) ;; Error thrown when a player tries to make a move when it is not their turn
+(define-constant ERR_GAME_TIMEOUT u105) ;; Error thrown when trying to cancel a game that hasn't timed out yet
+(define-constant ERR_GAME_ALREADY_FINISHED u106) ;; Error thrown when trying to cancel a game that already has a winner
+
+;; Timeout threshold: 45 minutes = 2700 seconds / 10 seconds per block = 270 blocks
+(define-constant TIMEOUT_BLOCKS u270)
 
 
 
@@ -20,7 +25,8 @@
         bet-amount: uint,
         board: (list 9 uint),
         
-        winner: (optional principal)
+        winner: (optional principal),
+        last-move-block: uint ;; Block height when the last move was made
     }
 )
 
@@ -57,7 +63,8 @@
             is-player-one-turn: false,
             bet-amount: bet-amount,
             board: game-board,
-            winner: none
+            winner: none,
+            last-move-block: stacks-block-height
         })
     )
 
@@ -94,7 +101,8 @@
         (game-data (merge original-game-data {
             board: game-board,
             player-two: (some contract-caller),
-            is-player-one-turn: true
+            is-player-one-turn: true,
+            last-move-block: stacks-block-height
         }))
     )
 
@@ -171,7 +179,8 @@
         (game-data (merge original-game-data {
             board: game-board,
             is-player-one-turn: (not is-player-one-turn),
-            winner: (if is-now-winner (some player-turn) none)
+            winner: (if is-now-winner (some player-turn) none),
+            last-move-block: stacks-block-height
         }))
     )
 
@@ -194,10 +203,73 @@
     (ok game-id)
 ))
 
+(define-public (cancel-game-timeout (game-id uint))
+    (let (
+        ;; Load the game data, throw an error if Game ID is invalid
+        (game-data (unwrap! (map-get? games game-id) (err ERR_GAME_NOT_FOUND)))
+        ;; Calculate blocks since last move
+        (blocks-since-last-move (- stacks-block-height (get last-move-block game-data)))
+        ;; Determine who can cancel (the player who is NOT currently supposed to move)
+        (player-one (get player-one game-data))
+        (player-two (get player-two game-data))
+        (is-player-one-turn (get is-player-one-turn game-data))
+        ;; The player who can cancel is the one waiting for their opponent to move
+        (canceling-player (if is-player-one-turn player-two (some player-one)))
+    )
+
+    ;; Ensure the game hasn't already finished
+    (asserts! (is-none (get winner game-data)) (err ERR_GAME_ALREADY_FINISHED))
+    
+    ;; Ensure both players have joined (player-two exists)
+    (asserts! (is-some player-two) (err ERR_GAME_CANNOT_BE_JOINED))
+    
+    ;; Ensure enough time has passed (45 minutes = 270 blocks)
+    (asserts! (>= blocks-since-last-move TIMEOUT_BLOCKS) (err ERR_GAME_TIMEOUT))
+    
+    ;; Ensure the caller is the player who is allowed to cancel (the one waiting for opponent's move)
+    (asserts! (is-eq (some contract-caller) canceling-player) (err ERR_NOT_YOUR_TURN))
+
+    ;; Remove the game from the map
+    (map-delete games game-id)
+    
+    ;; Refund both players their bet amounts
+    (try! (as-contract (stx-transfer? (get bet-amount game-data) tx-sender player-one)))
+    (try! (as-contract (stx-transfer? (get bet-amount game-data) tx-sender (unwrap! player-two (err ERR_GAME_NOT_FOUND)))))
+
+    ;; Log the timeout cancellation
+    (print {action: "timeout-cancel", game-id: game-id, canceled-by: contract-caller})
+    
+    ;; Return success
+    (ok true)
+))
+
 (define-read-only (get-game (game-id uint))
     (map-get? games game-id)
 )
 
 (define-read-only (get-latest-game-id)
     (var-get latest-game-id)
+)
+
+(define-read-only (is-game-timed-out (game-id uint))
+    (match (map-get? games game-id)
+        game-data 
+        (let (
+            (blocks-since-last-move (- stacks-block-height (get last-move-block game-data)))
+        )
+        ;; Return true if game exists and has timed out, false otherwise
+        (and 
+            (is-none (get winner game-data)) ;; Game hasn't finished
+            (is-some (get player-two game-data)) ;; Both players have joined
+            (>= blocks-since-last-move TIMEOUT_BLOCKS) ;; Timeout period has passed
+        ))
+        false ;; Game doesn't exist
+    )
+)
+
+(define-read-only (get-blocks-since-last-move (game-id uint))
+    (match (map-get? games game-id)
+        game-data (- stacks-block-height (get last-move-block game-data))
+        u0 ;; Game doesn't exist
+    )
 )
